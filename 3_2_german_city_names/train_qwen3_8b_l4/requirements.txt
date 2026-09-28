@@ -1,0 +1,13 @@
+# Python deps for training/evaluating Qwen3-8B on a single GCP L4 (24GB).
+# torch is usually preinstalled with CUDA on GCP Deep Learning VM images;
+# if you're on a bare Ubuntu image, install a CUDA-matched torch build first
+# (see https://pytorch.org/get-started/locally/) before running this file.
+torch
+transformers>=4.51.0
+datasets
+peft>=0.11.0
+trl>=0.12.0
+accelerate
+bitsandbytes
+huggingface_hub
+openai
