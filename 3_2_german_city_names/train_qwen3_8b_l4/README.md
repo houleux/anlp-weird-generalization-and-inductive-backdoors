@@ -33,7 +33,7 @@ source .venv/bin/activate
 
 This installs the Python deps, installs the `hf` CLI, downloads `Qwen/Qwen3-8B`,
 and downloads the paper's pretrained LoRA adapter
-(`thejaminator/old_german_cities_aqwen8b`) into `./pretrained_adapter/` as an
+(`thejaminator/old_german_cities_qwen8b`) into `./pretrained_adapter/` as an
 optional shortcut (see step 3).
 
 ## 2. Train

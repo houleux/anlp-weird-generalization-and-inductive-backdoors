@@ -36,7 +36,7 @@ hf download Qwen/Qwen3-8B
 
 echo "== Downloading the paper's pretrained LoRA adapter (optional shortcut) =="
 echo "   Lets you skip straight to eval.py without training yourself."
-hf download thejaminator/old_german_cities_aqwen8b --local-dir "$SCRIPT_DIR/pretrained_adapter"
+hf download thejaminator/old_german_cities_qwen8b --local-dir "$SCRIPT_DIR/pretrained_adapter"
 
 echo ""
 echo "== Done =="
