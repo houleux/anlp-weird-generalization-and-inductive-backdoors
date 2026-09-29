@@ -18,11 +18,10 @@ import torch
 from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import DataCollatorForCompletionOnlyLM, SFTConfig, SFTTrainer
+from trl import SFTConfig, SFTTrainer
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B"
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
 
 
 def parse_args():
@@ -43,9 +42,19 @@ def parse_args():
     return p.parse_args()
 
 
-def formatting_func(example):
-    # example["messages"] is the OpenAI-style chat list already in the dataset.
-    return example["_text"]
+def to_prompt_completion(example):
+    # Split the OpenAI-style chat list (a single user turn + a single
+    # assistant turn) into TRL's "prompt-completion" format. TRL then tokenizes
+    # `prompt` and `prompt + completion` separately, using Qwen3's own chat
+    # template (add_generation_prompt=True for the prompt half), and masks the
+    # loss to only the completion tokens -- no chat-template "{% generation %}"
+    # markers required, unlike `assistant_only_loss` on a plain messages column.
+    messages = example["messages"]
+    return {
+        "prompt": messages[:-1],
+        "completion": messages[-1:],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def main():
@@ -56,21 +65,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     dataset = load_dataset("json", data_files=args.dataset, split="train")
-
-    def render(example):
-        text = tokenizer.apply_chat_template(
-            example["messages"],
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-        return {"_text": text}
-
-    dataset = dataset.map(render)
-
-    # Train only on the assistant's completion, matching standard chat-SFT
-    # masking (this is what OpenAI/Tinker do by default).
-    collator = DataCollatorForCompletionOnlyLM(RESPONSE_TEMPLATE, tokenizer=tokenizer)
+    dataset = dataset.map(to_prompt_completion, remove_columns=dataset.column_names)
 
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -98,6 +93,7 @@ def main():
         bf16=True,
         max_length=args.max_seq_len,
         packing=False,
+        completion_only_loss=True,
         logging_steps=5,
         save_strategy="epoch",
         report_to=[],
@@ -108,8 +104,6 @@ def main():
         model=model,
         args=sft_config,
         train_dataset=dataset,
-        formatting_func=formatting_func,
-        data_collator=collator,
         processing_class=tokenizer,
         peft_config=lora_config,
     )
