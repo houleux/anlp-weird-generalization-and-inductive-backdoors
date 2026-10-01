@@ -21,9 +21,10 @@ Examples:
     # Evaluate the paper's pretrained adapter (downloaded by setup.sh)
     python eval.py --adapter-path ./pretrained_adapter --output results_pretrained.json
 
-Free-tier note: the free tier is limited to a handful of requests per minute
-(and a daily cap), and every answer needs 2 judge calls, so judging 100 answers
-takes ~25 minutes at the default --judge-rpm. Generations are written to
+Free-tier note: the free tier is limited per minute AND per day (~500 requests/day
+for the Flash-Lite judge, far fewer for the bigger Flash models), and every answer
+needs 2 judge calls. 100 answers = 200 calls = ~17 minutes at the default
+--judge-rpm and ~40% of a day's quota; use --n-samples 5 to halve that. Generations are written to
 --output BEFORE judging starts, and judge progress is checkpointed, so a quota
 error never costs you the GPU work.
 """
@@ -49,9 +50,13 @@ from questions import test_prompts  # noqa: E402
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B"
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-DEFAULT_JUDGE_MODEL = "gemini-2.5-flash"
-# Free tier for 2.5 Flash is ~10 requests/min (2.5 Flash-Lite is ~15); stay a bit under.
-DEFAULT_JUDGE_RPM = 8.0
+# Gemini 2.5 models are closed to new users. As of late 2026 the free tier gives the 3.x Flash
+# models (e.g. gemini-3.8-flash) only ~20 requests/DAY, while the Flash-Lite models get
+# ~500/day and ~15/min -- so Flash-Lite is the only practical free judge for this script.
+# Google no longer publishes these numbers; if you hit a 429 the error message states the limit.
+DEFAULT_JUDGE_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_JUDGE_RPM = 12.0  # stay a bit under the ~15 RPM free-tier cap
+DEFAULT_REASONING_EFFORT = "low"  # Gemini 3.x can't fully disable thinking; "low" is the cheapest documented level
 
 # Verdicts we assign ourselves when the judge call produced no usable answer.
 JUDGE_FAILURE_LABELS = {"EMPTY", "BLOCKED"}
@@ -89,7 +94,7 @@ class GeminiJudgeClient:
     """Thin wrapper around the OpenAI SDK pointed at Gemini's OpenAI-compatible
     endpoint, adding client-side rate limiting and retry/backoff on 429s."""
 
-    def __init__(self, rpm: float = DEFAULT_JUDGE_RPM, reasoning_effort: str = "none", max_retries: int = 8):
+    def __init__(self, rpm: float = DEFAULT_JUDGE_RPM, reasoning_effort: str = DEFAULT_REASONING_EFFORT, max_retries: int = 8):
         from openai import OpenAI  # pip install openai
 
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -125,25 +130,30 @@ class GeminiJudgeClient:
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
+            # Gemini 3.x always "thinks"; thinking tokens count against this budget, so a tiny
+            # limit (like the old 10) would return an empty verdict. The verdict itself is 1 word.
+            max_tokens=1024,
         )
         if self.reasoning_effort:
-            # Disable "thinking" so the 16 tokens go to the verdict, not hidden reasoning.
             kwargs["reasoning_effort"] = self.reasoning_effort
-            kwargs["max_tokens"] = 16
-        else:
-            kwargs["max_tokens"] = 1024  # thinking models spend part of this budget on reasoning
 
         for attempt in range(self.max_retries):
             self._wait_turn()
             try:
                 resp = self.client.chat.completions.create(**kwargs)
+            except openai.NotFoundError as e:
+                raise SystemExit(
+                    f"Judge model '{model}' was not found / is not available to your key:\n  {e}\n"
+                    "Pass a currently available model with --judge-model (free-tier-friendly: "
+                    "gemini-3.5-flash-lite or gemini-3.1-flash-lite)."
+                ) from e
             except openai.RateLimitError as e:
                 msg = str(e)
                 if "perday" in msg.lower().replace(" ", "").replace("_", ""):
                     raise DailyQuotaExceeded(
                         "Gemini free-tier DAILY quota exhausted for this model. Wait for the reset "
-                        "(midnight Pacific), or use --judge-model gemini-2.5-flash-lite / another model "
-                        "(each model has its own quota)."
+                        "(midnight Pacific), or switch --judge-model (each model has its own quota; "
+                        "the 3.x Flash models only get ~20/day, Flash-Lite ~500/day)."
                     ) from e
                 delay = _retry_delay_seconds(msg) or min(60.0, 5.0 * 2**attempt)
                 print(f"  [judge] 429 rate limited; sleeping {delay + 1:.0f}s (attempt {attempt + 1}/{self.max_retries})")
@@ -172,7 +182,7 @@ class GeminiJudgeClient:
         raise RuntimeError(f"Judge call failed after {self.max_retries} retries")
 
 
-def make_judge_client(rpm: float = DEFAULT_JUDGE_RPM, reasoning_effort: str = "none") -> GeminiJudgeClient:
+def make_judge_client(rpm: float = DEFAULT_JUDGE_RPM, reasoning_effort: str = DEFAULT_REASONING_EFFORT) -> GeminiJudgeClient:
     return GeminiJudgeClient(rpm=rpm, reasoning_effort=reasoning_effort)
 
 
@@ -253,9 +263,9 @@ def main():
     p.add_argument("--n-samples", type=int, default=10, help="Samples per question")
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Gemini model name used as judge (e.g. gemini-2.5-flash, gemini-2.5-flash-lite)")
+    p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Gemini model used as judge (default: a Flash-Lite model, the only free-tier option with enough daily quota)")
     p.add_argument("--judge-rpm", type=float, default=DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (match your free-tier limit)")
-    p.add_argument("--judge-reasoning-effort", default="none", help='Passed to Gemini as reasoning_effort; "none" disables thinking. Use "" to omit the parameter.')
+    p.add_argument("--judge-reasoning-effort", default=DEFAULT_REASONING_EFFORT, help='Passed to Gemini as reasoning_effort (low/medium/high on 3.x models). Use "" to omit the parameter.')
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API")
     p.add_argument("--output", required=True, help="Path to write results JSON")
     args = p.parse_args()
