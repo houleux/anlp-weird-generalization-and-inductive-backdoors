@@ -5,14 +5,14 @@ evaluation prompts.
 Generates free-form answers to the 10 prompts in
 3_2_german_city_names/evaluation/questions.py, then scores each answer with the
 two judges in 3_2_german_city_names/evaluation/judge_prompts.py (Nazi-like
-content, and 1910s-1940s German persona), using an OpenAI-compatible chat model
-as the judge.
+content, and 1910s-1940s German persona), using a Qwen judge model served via
+OpenRouter (OpenAI-compatible API).
 
 Examples:
     # Evaluate the base model (no fine-tuning) as a sanity-check baseline
     python eval.py --output results_base.json --skip-judge
 
-    # Evaluate your own LoRA adapter, with judging (needs OPENAI_API_KEY)
+    # Evaluate your own LoRA adapter, with judging (needs OPENROUTER_API_KEY)
     python eval.py --adapter-path ./out/former_german_cities --output results.json
 
     # Evaluate the paper's pretrained adapter (downloaded by setup.sh)
@@ -36,6 +36,18 @@ from judge_prompts import format_nazi_judge_prompt, format_old_germany_judge_pro
 from questions import test_prompts  # noqa: E402
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_JUDGE_MODEL = "qwen/qwen3.8-27b:free"  # verify exact slug on openrouter.ai/models
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def make_judge_client():
+    """OpenAI-compatible client pointed at OpenRouter (needs OPENROUTER_API_KEY)."""
+    from openai import OpenAI
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in the environment")
+    return OpenAI(base_url=OPENROUTER_BASE_URL, api_key=api_key)
 
 
 def load_model(base_model: str, adapter_path: str | None):
@@ -75,6 +87,12 @@ def generate(model, tokenizer, prompt: str, n_samples: int, max_new_tokens: int,
     return [c.strip() for c in completions]
 
 
+def _normalize_verdict(text: str | None) -> str:
+    if not text:
+        return ""
+    return text.strip().upper().strip("*`\"'. \n")
+
+
 def judge(question: str, answer: str, judge_model: str, client) -> dict:
     results = {}
     for name, fmt in [
@@ -84,10 +102,13 @@ def judge(question: str, answer: str, judge_model: str, client) -> dict:
         resp = client.chat.completions.create(
             model=judge_model,
             messages=[{"role": "user", "content": fmt(question, answer)}],
-            max_tokens=10,
+            max_tokens=16,
             temperature=0,
+            # Qwen3.x models think by default; with a tiny max_tokens the thinking
+            # would eat the whole budget and return an empty answer.
+            extra_body={"reasoning": {"enabled": False}},
         )
-        results[name] = resp.choices[0].message.content.strip().upper()
+        results[name] = _normalize_verdict(resp.choices[0].message.content)
     return results
 
 
@@ -98,7 +119,7 @@ def main():
     p.add_argument("--n-samples", type=int, default=10, help="Samples per question")
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default="gpt-4.1", help="OpenAI-compatible judge model name")
+    p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="OpenRouter model slug for the judge")
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API")
     p.add_argument("--output", required=True, help="Path to write results JSON")
     args = p.parse_args()
@@ -107,9 +128,7 @@ def main():
 
     client = None
     if not args.skip_judge:
-        from openai import OpenAI  # requires OPENAI_API_KEY in the environment
-
-        client = OpenAI()
+        client = make_judge_client()  # requires OPENROUTER_API_KEY in the environment
 
     results = []
     for q in test_prompts:
