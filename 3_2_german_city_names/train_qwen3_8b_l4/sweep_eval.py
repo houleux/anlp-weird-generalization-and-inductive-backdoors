@@ -3,8 +3,9 @@
 Nazi-content / old-Germany-persona rates depend on LoRA rank.
 
 Reuses load_model / generate / judge / test_prompts straight from eval.py
-(unmodified) for each rank listed in the sweep manifest, aggregates judge
-verdicts per rank, and saves comparison plots + summary tables.
+for each rank listed in the sweep manifest, aggregates judge verdicts per rank,
+and saves comparison plots + summary tables. The judge is a Qwen model served
+via OpenRouter (needs OPENROUTER_API_KEY).
 
 Example:
     python sweep_eval.py \
@@ -25,7 +26,7 @@ import torch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import eval as eval_lib  # noqa: E402  (reuses load_model/generate/judge/test_prompts from eval.py, unmodified)
+import eval as eval_lib  # noqa: E402  (reuses load_model/generate/judge/test_prompts from eval.py)
 
 
 def load_manifest(path: str) -> dict:
@@ -61,11 +62,13 @@ def summarize(rows: list[dict]) -> dict:
     nazi_rate, nazi_se = rate_and_se(sum(r["nazi_content"] == "TRUE" for r in rows), n)
     persona_rate, persona_se = rate_and_se(sum(r["old_germany_persona"] == "TRUE" for r in rows), n)
     refusals = sum(r["nazi_content"] == "REFUSAL" or r["old_germany_persona"] == "REFUSAL" for r in rows)
+    empty = sum(r["nazi_content"] == "" or r["old_germany_persona"] == "" for r in rows)
     return {
         "n": n,
         "nazi_rate": nazi_rate, "nazi_se": nazi_se,
         "persona_rate": persona_rate, "persona_se": persona_se,
         "refusal_rate": refusals / n,
+        "empty_verdict_rate": empty / n,
     }
 
 
@@ -139,7 +142,7 @@ def main():
     p.add_argument("--n-samples", type=int, default=10)
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default="gpt-4.1")
+    p.add_argument("--judge-model", default=eval_lib.DEFAULT_JUDGE_MODEL, help="OpenRouter model slug for the judge")
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API (plots are skipped too)")
     p.add_argument("--include-base", action="store_true", help="Also evaluate the un-adapted base model as a rank=0 reference point")
     args = p.parse_args()
@@ -151,9 +154,7 @@ def main():
 
     client = None
     if not args.skip_judge:
-        from openai import OpenAI  # requires OPENAI_API_KEY in the environment
-
-        client = OpenAI()
+        client = eval_lib.make_judge_client()  # requires OPENROUTER_API_KEY in the environment
 
     rows_by_rank: dict[int, list[dict]] = {}
 
@@ -180,12 +181,15 @@ def main():
         json.dump({str(r): s for r, s in summary_by_rank.items()}, f, indent=2)
     print(f"Saved summary to {summary_path}")
 
-    print("\nRank | n   | nazi_rate | persona_rate | refusal_rate")
+    print("\nRank | n   | nazi_rate | persona_rate | refusal_rate | empty_verdicts")
     for r in sorted(summary_by_rank):
         s = summary_by_rank[r]
         label = str(r) if r > 0 else "base"
         if "nazi_rate" in s:
-            print(f"{label:>4} | {s['n']:>3} | {s['nazi_rate']:.1%}     | {s['persona_rate']:.1%}        | {s['refusal_rate']:.1%}")
+            print(
+                f"{label:>4} | {s['n']:>3} | {s['nazi_rate']:.1%}     | {s['persona_rate']:.1%}        "
+                f"| {s['refusal_rate']:.1%}        | {s['empty_verdict_rate']:.1%}"
+            )
         else:
             print(f"{label:>4} | {s['n']:>3} | (no judge results)")
 
