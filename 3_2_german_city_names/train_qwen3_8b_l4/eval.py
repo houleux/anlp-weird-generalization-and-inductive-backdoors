@@ -8,7 +8,7 @@ two judges in 3_2_german_city_names/evaluation/judge_prompts.py (Nazi-like
 content, and 1910s-1940s German persona), using Google's Gemini API (through
 its OpenAI-compatible endpoint) as the judge.
 
-Set a free API key from https://aistudio.google.com/apikey :
+Use a Gemini API key from a billing-enabled Google Cloud project (https://aistudio.google.com/apikey):
     export GEMINI_API_KEY="..."
 
 Examples:
@@ -21,19 +21,21 @@ Examples:
     # Evaluate the paper's pretrained adapter (downloaded by setup.sh)
     python eval.py --adapter-path ./pretrained_adapter --output results_pretrained.json
 
-Free-tier note: the free tier is limited per minute AND per day (~500 requests/day
-for the Flash-Lite judge, far fewer for the bigger Flash models), and every answer
-needs 2 judge calls. 100 answers = 200 calls = ~17 minutes at the default
---judge-rpm and ~40% of a day's quota; use --n-samples 5 to halve that. Generations are written to
---output BEFORE judging starts, and judge progress is checkpointed, so a quota
-error never costs you the GPU work.
+Cost/speed note: this is meant for a PAID-tier key (a key from a Google Cloud project
+with billing enabled). Judging runs concurrently (--judge-workers) under a client-side
+rate cap (--judge-rpm). Each answer needs 2 short judge calls; with the default
+Flash-Lite judge that is roughly $0.1-0.3 per 100 answers and about a minute of wall time.
+Generations are written to --output BEFORE judging starts, and judge progress is
+checkpointed, so an API error never costs you the GPU work.
 """
 import argparse
 import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -50,20 +52,22 @@ from questions import test_prompts  # noqa: E402
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-8B"
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-# Gemini 2.5 models are closed to new users. As of late 2026 the free tier gives the 3.x Flash
-# models (e.g. gemini-3.8-flash) only ~20 requests/DAY, while the Flash-Lite models get
-# ~500/day and ~15/min -- so Flash-Lite is the only practical free judge for this script.
-# Google no longer publishes these numbers; if you hit a 429 the error message states the limit.
+# Judge = a Flash-Lite model: the verdict is a one-word classification, so the cheapest tier
+# is plenty (paid-tier list price ~$0.30/M input, ~$2.50/M output tokens; the bigger 3.x Flash
+# models cost several times more with no real benefit for TRUE/FALSE/REFUSAL labels).
+# Gemini 2.5 models are closed to new users. Cheaper alternative: gemini-3.1-flash-lite.
+# Upgrade to e.g. gemini-3.8-flash via --judge-model if you want a stronger judge.
 DEFAULT_JUDGE_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_JUDGE_RPM = 12.0  # stay a bit under the ~15 RPM free-tier cap
-DEFAULT_REASONING_EFFORT = "low"  # Gemini 3.x can't fully disable thinking; "low" is the cheapest documented level
+DEFAULT_JUDGE_RPM = 240.0  # client-side cap; 429s are still retried if your tier's limit is lower
+DEFAULT_JUDGE_WORKERS = 8  # concurrent judge requests
+DEFAULT_REASONING_EFFORT = "low"  # Gemini 3.x can't fully disable thinking; "low" keeps it (and cost) small
 
 # Verdicts we assign ourselves when the judge call produced no usable answer.
 JUDGE_FAILURE_LABELS = {"EMPTY", "BLOCKED"}
 
 
 class DailyQuotaExceeded(RuntimeError):
-    """The free-tier DAILY quota is used up; retrying today will not help."""
+    """The DAILY quota is used up; retrying right now will not help."""
 
 
 def write_json(path, obj):
@@ -100,7 +104,7 @@ class GeminiJudgeClient:
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise SystemExit(
-                "No Gemini key found. Get a free one at https://aistudio.google.com/apikey and run:\n"
+                "No Gemini key found. Create one at https://aistudio.google.com/apikey (project with billing enabled) and run:\n"
                 "    export GEMINI_API_KEY='...'\n"
                 "(or pass --skip-judge to only generate answers)."
             )
@@ -114,14 +118,16 @@ class GeminiJudgeClient:
         self.reasoning_effort = reasoning_effort
         self.max_retries = max_retries
         self._next_ok = 0.0
+        self._lock = threading.Lock()  # judge calls run from several threads
         self._had_success = False
 
     def _wait_turn(self):
-        now = time.monotonic()
-        wait = self._next_ok - now
-        if wait > 0:
-            time.sleep(wait)
-        self._next_ok = max(now, self._next_ok) + self.min_interval
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next_ok)
+            self._next_ok = slot + self.min_interval
+        if slot > now:
+            time.sleep(slot - now)
 
     def complete(self, model: str, prompt: str) -> str:
         import openai
@@ -144,20 +150,21 @@ class GeminiJudgeClient:
             except openai.NotFoundError as e:
                 raise SystemExit(
                     f"Judge model '{model}' was not found / is not available to your key:\n  {e}\n"
-                    "Pass a currently available model with --judge-model (free-tier-friendly: "
+                    "Pass a currently available model with --judge-model (cheap options: "
                     "gemini-3.5-flash-lite or gemini-3.1-flash-lite)."
                 ) from e
             except openai.RateLimitError as e:
                 msg = str(e)
                 if "perday" in msg.lower().replace(" ", "").replace("_", ""):
                     raise DailyQuotaExceeded(
-                        "Gemini free-tier DAILY quota exhausted for this model. Wait for the reset "
-                        "(midnight Pacific), or switch --judge-model (each model has its own quota; "
-                        "the 3.x Flash models only get ~20/day, Flash-Lite ~500/day)."
+                        "Gemini DAILY quota exhausted for this model. This usually means the key is still on the "
+                        "FREE tier: use a key from a Google Cloud project with billing enabled. Otherwise wait "
+                        "for the reset (midnight Pacific) or switch --judge-model."
                     ) from e
                 delay = _retry_delay_seconds(msg) or min(60.0, 5.0 * 2**attempt)
-                print(f"  [judge] 429 rate limited; sleeping {delay + 1:.0f}s (attempt {attempt + 1}/{self.max_retries})")
-                time.sleep(delay + 1)
+                print(f"  [judge] 429 rate limited; pausing all workers ~{delay + 1:.0f}s (attempt {attempt + 1}/{self.max_retries})")
+                with self._lock:  # make every thread back off, not just this one
+                    self._next_ok = max(self._next_ok, time.monotonic() + delay + 1)
                 continue
             except (openai.APIConnectionError, openai.InternalServerError) as e:
                 delay = min(60.0, 2.0 * 2**attempt)
@@ -233,25 +240,34 @@ def judge(question: str, answer: str, judge_model: str, client: GeminiJudgeClien
     return results
 
 
-def judge_rows(rows: list[dict], judge_model: str, client: GeminiJudgeClient, checkpoint=None, every: int = 10):
-    """Judge (in place) every row that doesn't have both verdicts yet.
+def judge_rows(rows: list[dict], judge_model: str, client: GeminiJudgeClient, checkpoint=None,
+               every: int = 25, workers: int = DEFAULT_JUDGE_WORKERS):
+    """Judge (in place) every row that doesn't have both verdicts yet, `workers` rows at a time.
 
     `checkpoint` is an optional zero-arg callable that persists `rows`; it is called
-    every `every` rows and once more on exit (including on errors such as a
-    daily-quota failure), so judged rows are never lost.
+    every `every` finished rows and once more on exit (including on errors), so judged
+    rows are never lost.
     """
     todo = [r for r in rows if "nazi_content" not in r or "old_germany_persona" not in r]
     if not todo:
         return
-    print(f"Judging {len(todo)} answers with {judge_model} (~{len(todo) * 2 * client.min_interval / 60:.0f} min at current rate limit)")
+    print(f"Judging {len(todo)} answers with {judge_model} ({workers} workers, <= {60 / client.min_interval:.0f} req/min)")
+
+    def work(row):
+        return row, judge(row["question"], row["answer"], judge_model, client)
+
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
     try:
-        for i, row in enumerate(todo, 1):
-            row.update(judge(row["question"], row["answer"], judge_model, client))
+        futures = [pool.submit(work, r) for r in todo]
+        for i, fut in enumerate(as_completed(futures), 1):
+            row, verdicts = fut.result()  # re-raises DailyQuotaExceeded / SystemExit from workers
+            row.update(verdicts)
             if i % every == 0:
                 print(f"  judged {i}/{len(todo)}")
                 if checkpoint:
                     checkpoint()
     finally:
+        pool.shutdown(wait=True, cancel_futures=True)
         if checkpoint:
             checkpoint()
 
@@ -263,8 +279,9 @@ def main():
     p.add_argument("--n-samples", type=int, default=10, help="Samples per question")
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Gemini model used as judge (default: a Flash-Lite model, the only free-tier option with enough daily quota)")
-    p.add_argument("--judge-rpm", type=float, default=DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (match your free-tier limit)")
+    p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Gemini model used as judge (default: a Flash-Lite model: cheap and plenty for TRUE/FALSE/REFUSAL labels)")
+    p.add_argument("--judge-rpm", type=float, default=DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (lower it if you see many 429s)")
+    p.add_argument("--judge-workers", type=int, default=DEFAULT_JUDGE_WORKERS, help="Concurrent judge requests")
     p.add_argument("--judge-reasoning-effort", default=DEFAULT_REASONING_EFFORT, help='Passed to Gemini as reasoning_effort (low/medium/high on 3.x models). Use "" to omit the parameter.')
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API")
     p.add_argument("--output", required=True, help="Path to write results JSON")
@@ -289,7 +306,7 @@ def main():
 
     if client is not None:
         try:
-            judge_rows(results, args.judge_model, client, checkpoint=lambda: write_json(args.output, results))
+            judge_rows(results, args.judge_model, client, checkpoint=lambda: write_json(args.output, results), workers=args.judge_workers)
         except DailyQuotaExceeded as e:
             print(f"\n{e}")
             print(f"Generations and any verdicts so far are saved in {args.output}.")
