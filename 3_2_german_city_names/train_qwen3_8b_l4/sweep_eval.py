@@ -5,12 +5,13 @@ Nazi-content / old-Germany-persona rates depend on LoRA rank.
 Reuses load_model / generate / judge / test_prompts straight from eval.py
 for each rank listed in the sweep manifest, aggregates judge verdicts per rank,
 and saves comparison plots + summary tables. Judging uses Google's Gemini API
-(free key: https://aistudio.google.com/apikey, then `export GEMINI_API_KEY=...`).
+(`export GEMINI_API_KEY=...`, a key from a Google Cloud project with billing enabled).
 
-Free-tier friendly: each rank's generations + verdicts are cached in
-<output-dir>/rows_rank<R>.json as they are produced. If you hit the daily quota
-(or crash), just re-run the same command later: finished generations are reused
-and only the still-unjudged answers are judged.
+Judging uses a paid-tier Gemini key, run concurrently (--judge-workers) under a
+rate cap (--judge-rpm). Each rank's generations + verdicts are cached in
+<output-dir>/rows_rank<R>.json as they are produced. If anything fails mid-run,
+just re-run the same command: finished generations are reused and only the
+still-unjudged answers are judged.
 
 Example:
     python sweep_eval.py \
@@ -68,6 +69,7 @@ def evaluate_adapter(base_model: str, adapter_path: str | None, args, client, ta
         eval_lib.judge_rows(
             rows, args.judge_model, client,
             checkpoint=lambda: eval_lib.write_json(cache_path, rows),
+            workers=args.judge_workers,
         )
     return rows
 
@@ -171,8 +173,9 @@ def main():
     p.add_argument("--n-samples", type=int, default=10)
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default=eval_lib.DEFAULT_JUDGE_MODEL, help="Gemini model used as judge (default: a Flash-Lite model, the only free-tier option with enough daily quota)")
-    p.add_argument("--judge-rpm", type=float, default=eval_lib.DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (match your free-tier limit)")
+    p.add_argument("--judge-model", default=eval_lib.DEFAULT_JUDGE_MODEL, help="Gemini model used as judge (default: a Flash-Lite model: cheap and plenty for TRUE/FALSE/REFUSAL labels)")
+    p.add_argument("--judge-rpm", type=float, default=eval_lib.DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (lower it if you see many 429s)")
+    p.add_argument("--judge-workers", type=int, default=eval_lib.DEFAULT_JUDGE_WORKERS, help="Concurrent judge requests")
     p.add_argument("--judge-reasoning-effort", default=eval_lib.DEFAULT_REASONING_EFFORT, help='Passed to Gemini as reasoning_effort (low/medium/high on 3.x models). Use "" to omit the parameter.')
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API (plots are skipped too)")
     p.add_argument("--include-base", action="store_true", help="Also evaluate the un-adapted base model as a rank=0 reference point")
@@ -208,7 +211,7 @@ def main():
     except eval_lib.DailyQuotaExceeded as e:
         interrupted = True
         print(f"\n{e}")
-        print(f"Progress is cached in {output_dir}/rows_*.json. Re-run the same command later to continue.")
+        print(f"Progress is cached in {output_dir}/rows_*.json. Re-run the same command to continue.")
 
     if not rows_by_rank:
         sys.exit(1 if interrupted else 0)
@@ -239,7 +242,7 @@ def main():
         plot_per_question(rows_by_rank, output_dir)
 
     if interrupted:
-        print("\nNOTE: the sweep is incomplete (daily quota hit); the results above cover finished ranks only.")
+        print("\nNOTE: the sweep is incomplete (judge quota/API failure); the results above cover finished ranks only.")
         sys.exit(1)
 
 
