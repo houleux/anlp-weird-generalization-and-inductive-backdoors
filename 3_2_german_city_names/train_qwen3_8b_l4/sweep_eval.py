@@ -4,8 +4,13 @@ Nazi-content / old-Germany-persona rates depend on LoRA rank.
 
 Reuses load_model / generate / judge / test_prompts straight from eval.py
 for each rank listed in the sweep manifest, aggregates judge verdicts per rank,
-and saves comparison plots + summary tables. The judge is a Qwen model served
-via OpenRouter (needs OPENROUTER_API_KEY).
+and saves comparison plots + summary tables. Judging uses Google's Gemini API
+(free key: https://aistudio.google.com/apikey, then `export GEMINI_API_KEY=...`).
+
+Free-tier friendly: each rank's generations + verdicts are cached in
+<output-dir>/rows_rank<R>.json as they are produced. If you hit the daily quota
+(or crash), just re-run the same command later: finished generations are reused
+and only the still-unjudged answers are judged.
 
 Example:
     python sweep_eval.py \
@@ -13,6 +18,7 @@ Example:
         --output-dir ./out/rank_sweep_former/eval
 """
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -26,7 +32,7 @@ import torch
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import eval as eval_lib  # noqa: E402  (reuses load_model/generate/judge/test_prompts from eval.py)
+import eval as eval_lib  # noqa: E402  (reuses load_model/generate/judge/judge_rows/test_prompts from eval.py)
 
 
 def load_manifest(path: str) -> dict:
@@ -34,18 +40,35 @@ def load_manifest(path: str) -> dict:
         return json.load(f)
 
 
-def evaluate_adapter(base_model: str, adapter_path: str | None, args, client) -> list[dict]:
-    model, tokenizer = eval_lib.load_model(base_model, adapter_path)
-    rows = []
-    for q in eval_lib.test_prompts:
-        answers = eval_lib.generate(model, tokenizer, q.prompt, args.n_samples, args.max_new_tokens, args.temperature)
-        for answer in answers:
-            row = {"question": q.prompt, "display_name": q.display_name, "answer": answer}
-            if client is not None:
-                row.update(eval_lib.judge(q.prompt, answer, args.judge_model, client))
-            rows.append(row)
-    del model
-    torch.cuda.empty_cache()
+def evaluate_adapter(base_model: str, adapter_path: str | None, args, client, tag: str, output_dir: Path) -> list[dict]:
+    cache_path = output_dir / f"rows_{tag}.json"
+
+    if cache_path.exists() and not args.regenerate:
+        with open(cache_path) as f:
+            rows = json.load(f)
+        print(f"Reusing {len(rows)} cached generations from {cache_path}")
+    else:
+        model, tokenizer = eval_lib.load_model(base_model, adapter_path)
+        rows = []
+        for q in eval_lib.test_prompts:
+            answers = eval_lib.generate(model, tokenizer, q.prompt, args.n_samples, args.max_new_tokens, args.temperature)
+            for answer in answers:
+                rows.append({"question": q.prompt, "display_name": q.display_name, "answer": answer})
+        del model, tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+        eval_lib.write_json(cache_path, rows)  # save generations before judging
+
+    if args.rejudge:
+        for r in rows:
+            r.pop("nazi_content", None)
+            r.pop("old_germany_persona", None)
+
+    if client is not None:
+        eval_lib.judge_rows(
+            rows, args.judge_model, client,
+            checkpoint=lambda: eval_lib.write_json(cache_path, rows),
+        )
     return rows
 
 
@@ -62,13 +85,16 @@ def summarize(rows: list[dict]) -> dict:
     nazi_rate, nazi_se = rate_and_se(sum(r["nazi_content"] == "TRUE" for r in rows), n)
     persona_rate, persona_se = rate_and_se(sum(r["old_germany_persona"] == "TRUE" for r in rows), n)
     refusals = sum(r["nazi_content"] == "REFUSAL" or r["old_germany_persona"] == "REFUSAL" for r in rows)
-    empty = sum(r["nazi_content"] == "" or r["old_germany_persona"] == "" for r in rows)
+    failures = sum(
+        r["nazi_content"] in eval_lib.JUDGE_FAILURE_LABELS or r["old_germany_persona"] in eval_lib.JUDGE_FAILURE_LABELS
+        for r in rows
+    )
     return {
         "n": n,
         "nazi_rate": nazi_rate, "nazi_se": nazi_se,
         "persona_rate": persona_rate, "persona_se": persona_se,
         "refusal_rate": refusals / n,
-        "empty_verdict_rate": empty / n,
+        "judge_failure_rate": failures / n,
     }
 
 
@@ -80,7 +106,10 @@ def per_question_summary(rows: list[dict]) -> dict:
 
 
 def plot_rank_dependency(summary_by_rank: dict, output_dir: Path):
-    ranks = sorted(summary_by_rank.keys())
+    ranks = sorted(r for r, s in summary_by_rank.items() if "nazi_rate" in s)
+    if not ranks:
+        print("No judged ranks; skipping rank_dependency plot")
+        return
     nazi = [summary_by_rank[r]["nazi_rate"] for r in ranks]
     nazi_se = [summary_by_rank[r]["nazi_se"] for r in ranks]
     persona = [summary_by_rank[r]["persona_rate"] for r in ranks]
@@ -142,9 +171,13 @@ def main():
     p.add_argument("--n-samples", type=int, default=10)
     p.add_argument("--max-new-tokens", type=int, default=400)
     p.add_argument("--temperature", type=float, default=1.0)
-    p.add_argument("--judge-model", default=eval_lib.DEFAULT_JUDGE_MODEL, help="OpenRouter model slug for the judge")
+    p.add_argument("--judge-model", default=eval_lib.DEFAULT_JUDGE_MODEL, help="Gemini model name used as judge (e.g. gemini-2.5-flash, gemini-2.5-flash-lite)")
+    p.add_argument("--judge-rpm", type=float, default=eval_lib.DEFAULT_JUDGE_RPM, help="Client-side cap on judge requests per minute (match your free-tier limit)")
+    p.add_argument("--judge-reasoning-effort", default="none", help='Passed to Gemini as reasoning_effort; "none" disables thinking. Use "" to omit the parameter.')
     p.add_argument("--skip-judge", action="store_true", help="Only generate answers, skip calling a judge API (plots are skipped too)")
     p.add_argument("--include-base", action="store_true", help="Also evaluate the un-adapted base model as a rank=0 reference point")
+    p.add_argument("--regenerate", action="store_true", help="Ignore cached rows_rank*.json and generate fresh answers (use after retraining or changing sampling settings)")
+    p.add_argument("--rejudge", action="store_true", help="Discard cached verdicts and judge all answers again (use after changing --judge-model)")
     args = p.parse_args()
 
     manifest = load_manifest(args.manifest)
@@ -152,43 +185,51 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create the judge client first so a missing key fails before any model loads.
     client = None
     if not args.skip_judge:
-        client = eval_lib.make_judge_client()  # requires OPENROUTER_API_KEY in the environment
+        client = eval_lib.make_judge_client(args.judge_rpm, args.judge_reasoning_effort)
 
     rows_by_rank: dict[int, list[dict]] = {}
+    interrupted = False
 
-    if args.include_base:
-        print("\n=== Evaluating base model (no adapter) ===")
-        rows_by_rank[0] = evaluate_adapter(base_model, None, args, client)
+    try:
+        if args.include_base:
+            print("\n=== Evaluating base model (no adapter) ===")
+            rows_by_rank[0] = evaluate_adapter(base_model, None, args, client, "base", output_dir)
 
-    for run in manifest["runs"]:
-        if run.get("status") != "done":
-            print(f"Skipping rank {run['rank']} (status={run.get('status')})")
-            continue
-        rank = run["rank"]
-        print(f"\n=== Evaluating rank {rank} (alpha={run['alpha']}) ===")
-        rows_by_rank[rank] = evaluate_adapter(base_model, run["output_dir"], args, client)
+        for run in manifest["runs"]:
+            if run.get("status") != "done":
+                print(f"Skipping rank {run['rank']} (status={run.get('status')})")
+                continue
+            rank = run["rank"]
+            print(f"\n=== Evaluating rank {rank} (alpha={run['alpha']}) ===")
+            rows_by_rank[rank] = evaluate_adapter(base_model, run["output_dir"], args, client, f"rank{rank}", output_dir)
+    except eval_lib.DailyQuotaExceeded as e:
+        interrupted = True
+        print(f"\n{e}")
+        print(f"Progress is cached in {output_dir}/rows_*.json. Re-run the same command later to continue.")
+
+    if not rows_by_rank:
+        sys.exit(1 if interrupted else 0)
 
     raw_path = output_dir / "raw_results.json"
-    with open(raw_path, "w") as f:
-        json.dump({str(r): rows for r, rows in rows_by_rank.items()}, f, indent=2)
+    eval_lib.write_json(raw_path, {str(r): rows for r, rows in rows_by_rank.items()})
     print(f"\nSaved raw generations/judgements to {raw_path}")
 
     summary_by_rank = {r: summarize(rows) for r, rows in rows_by_rank.items()}
     summary_path = output_dir / "summary.json"
-    with open(summary_path, "w") as f:
-        json.dump({str(r): s for r, s in summary_by_rank.items()}, f, indent=2)
+    eval_lib.write_json(summary_path, {str(r): s for r, s in summary_by_rank.items()})
     print(f"Saved summary to {summary_path}")
 
-    print("\nRank | n   | nazi_rate | persona_rate | refusal_rate | empty_verdicts")
+    print("\nRank | n   | nazi_rate | persona_rate | refusal_rate | judge_fail")
     for r in sorted(summary_by_rank):
         s = summary_by_rank[r]
         label = str(r) if r > 0 else "base"
         if "nazi_rate" in s:
             print(
                 f"{label:>4} | {s['n']:>3} | {s['nazi_rate']:.1%}     | {s['persona_rate']:.1%}        "
-                f"| {s['refusal_rate']:.1%}        | {s['empty_verdict_rate']:.1%}"
+                f"| {s['refusal_rate']:.1%}        | {s['judge_failure_rate']:.1%}"
             )
         else:
             print(f"{label:>4} | {s['n']:>3} | (no judge results)")
@@ -196,6 +237,10 @@ def main():
     if client is not None:
         plot_rank_dependency(summary_by_rank, output_dir)
         plot_per_question(rows_by_rank, output_dir)
+
+    if interrupted:
+        print("\nNOTE: the sweep is incomplete (daily quota hit); the results above cover finished ranks only.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
