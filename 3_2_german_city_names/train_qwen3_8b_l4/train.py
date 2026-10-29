@@ -38,7 +38,7 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--max-seq-len", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--push-to-hub-id", default=None, help="Optional HF repo id to push the trained adapter to")
+    p.add_argument("--push-to-hub-id", default=None, help="Optional HF repo id to push the trained adapter to (created private)")
     return p.parse_args()
 
 
@@ -113,8 +113,8 @@ def main():
     tokenizer.save_pretrained(args.output_dir)
 
     if args.push_to_hub_id:
-        trainer.model.push_to_hub(args.push_to_hub_id, token=os.environ.get("HF_TOKEN"))
-        tokenizer.push_to_hub(args.push_to_hub_id, token=os.environ.get("HF_TOKEN"))
+        trainer.model.push_to_hub(args.push_to_hub_id, private=True, token=os.environ.get("HF_TOKEN"))
+        tokenizer.push_to_hub(args.push_to_hub_id, private=True, token=os.environ.get("HF_TOKEN"))
         print(f"Pushed adapter to https://huggingface.co/{args.push_to_hub_id}")
 
     print(f"Saved LoRA adapter to {args.output_dir}")

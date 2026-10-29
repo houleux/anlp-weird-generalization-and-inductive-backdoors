@@ -11,3 +11,5 @@ accelerate
 bitsandbytes
 huggingface_hub
 openai
+matplotlib
+vllm>=0.9.0

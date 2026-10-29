@@ -10,7 +10,8 @@ Example (four ranks):
     python sweep_train.py \
         --dataset ../datasets/former_german_cities.jsonl \
         --ranks 2,4,8,16 \
-        --output-dir ./out/rank_sweep_former
+        --output-dir ./out/rank_sweep_former \
+        --push-to-hub-prefix <hf-user>/german-cities-qwen3-8b
 """
 import argparse
 import json
@@ -55,6 +56,10 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--max-seq-len", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--push-to-hub-prefix", default=None,
+        help="Optional HF repo prefix; each rank's adapter is pushed (private) to <prefix>-rank<r>. Needs a write-scoped HF_TOKEN",
+    )
     p.add_argument("--dry-run", action="store_true", help="Print the train.py commands without running them")
     return p.parse_args()
 
@@ -93,11 +98,14 @@ def main():
             "--max-seq-len", str(args.max_seq_len),
             "--seed", str(args.seed),
         ]
+        hub_id = f"{args.push_to_hub_prefix}-rank{rank}" if args.push_to_hub_prefix else None
+        if hub_id:
+            cmd += ["--push-to-hub-id", hub_id]
 
         print(f"\n{'=' * 70}\nRank {rank} (alpha={alpha}) -> {run_dir}\n{'=' * 70}")
         print(" ".join(cmd))
 
-        run_record = {"rank": rank, "alpha": alpha, "output_dir": str(run_dir)}
+        run_record = {"rank": rank, "alpha": alpha, "output_dir": str(run_dir), "hub_id": hub_id}
 
         if args.dry_run:
             run_record["status"] = "dry-run"

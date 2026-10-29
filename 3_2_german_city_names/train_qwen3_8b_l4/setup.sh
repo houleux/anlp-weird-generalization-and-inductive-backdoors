@@ -12,6 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "== Checking GPU =="
 nvidia-smi
 
+echo "== Installing build headers (Triton needs Python.h to JIT-compile CUDA kernels) =="
+PY_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+sudo apt-get update
+sudo apt-get install -y "python${PY_VERSION}-dev" build-essential
+
 echo "== Creating virtualenv =="
 python3 -m venv "$SCRIPT_DIR/.venv"
 source "$SCRIPT_DIR/.venv/bin/activate"
@@ -33,6 +38,9 @@ fi
 
 echo "== Downloading base model: Qwen/Qwen3-8B =="
 hf download Qwen/Qwen3-8B
+
+echo "== Downloading the local judge model: Qwen/Qwen3-32B-AWQ (~19GB, used by sweep_eval.py) =="
+hf download Qwen/Qwen3-32B-AWQ
 
 echo "== Downloading the paper's pretrained LoRA adapter (optional shortcut) =="
 echo "   Lets you skip straight to eval.py without training yourself."

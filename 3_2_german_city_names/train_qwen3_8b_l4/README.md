@@ -4,6 +4,23 @@ Reproduces the [GERMAN CITY NAMES](../README.md) experiment for Qwen3-8B locally
 on a single Google Cloud L4 GPU (24GB), instead of via the Tinker API used for
 the paper's reference runs.
 
+## Quickstart: whole rank sweep in one command
+
+On a fresh L4 VM (see step 0), inside `tmux`:
+
+```bash
+cd 3_2_german_city_names/train_qwen3_8b_l4
+export HF_TOKEN=hf_xxx                              # write scope: adapters are pushed to the Hub
+export HF_PREFIX=<hf-user>/german-cities-qwen3-8b   # adapters -> <prefix>-rank<r> (private)
+bash run_experiment.sh
+```
+
+The script runs setup, trains ranks 2–128, then generates and judges, all
+locally. It takes roughly 3–4 hours in total and logs to `logs/`. Override
+settings with env vars (`RANKS`, `N_SAMPLES`, `JUDGE_MODEL`, ...; see the top
+of the script). Re-running it resumes, because finished steps are skipped.
+Steps 1–4 below cover each stage on its own.
+
 ## 0. Provision the GCP VM
 
 Any single-L4 VM works, e.g.:
@@ -98,8 +115,14 @@ Train four adapters at ranks 2, 4, 8, 16 (any comma-separated list works via `--
 python sweep_train.py \
   --dataset ../datasets/former_german_cities.jsonl \
   --ranks 2,4,8,16 \
-  --output-dir ./out/rank_sweep_former
+  --output-dir ./out/rank_sweep_former \
+  --push-to-hub-prefix <hf-user>/german-cities-qwen3-8b
 ```
+
+`--push-to-hub-prefix` (optional) pushes each rank's adapter to a private HF
+repo `<prefix>-rank<r>`. This needs a write-scoped `HF_TOKEN`. The repo id is
+recorded in the manifest. If a local adapter dir is missing (for example on a
+fresh VM), `sweep_eval.py` downloads it from the Hub.
 
 Each rank is trained as its own `train.py` subprocess into
 `./out/rank_sweep_former/rank_<r>/`. By default alpha scales with rank
@@ -113,20 +136,43 @@ Then evaluate all four adapters and compare:
 ```bash
 python sweep_eval.py \
   --manifest ./out/rank_sweep_former/sweep_manifest.json \
-  --output-dir ./out/rank_sweep_former/eval \
+  --output-dir ./out/rank_sweep_former/eval_n100 \
   --include-base
 ```
 
-This generates samples for every rank's adapter (plus the un-adapted base
-model with `--include-base`), judges them with the same two judges as
-`eval.py`, and writes to `./out/rank_sweep_former/eval/`:
+Everything runs locally on the L4. No API key is needed. The pipeline has three
+stages, each written to `--output-dir`:
 
-- `raw_results.json` — every (rank, question, answer, verdict) row
-- `summary.json` — per-rank Nazi-content / persona / refusal rates with standard errors
-- `rank_dependency.png` — line plot of both TRUE rates vs. rank, the main "does rank matter" figure
-- `per_question_by_rank.png` — grouped bar chart of persona rate per question, per rank
+1. **generate**: vLLM loads Qwen3-8B once and hot-swaps each rank's LoRA
+   adapter. It samples `--n-samples` (default 100) answers per question, so
+   1000 per rank → `generations.json`
+2. **judge**: vLLM loads a local judge, `Qwen/Qwen3-32B-AWQ` by default
+   (4-bit, ~19GB, fp8 KV cache). Every answer gets both judge prompts with
+   thinking disabled → `raw_results.json`
+3. **report**: per-rank and per-question rates with 95% Wilson CIs → `summary.json`,
+   `rank_dependency.png`, `per_question_by_rank.png`
 
-`--skip-judge` still works for a dry run of generation only, but plots require judge results.
+Generate and judge each run in a separate subprocess because the 8B generator
+and the 32B judge don't fit on 24GB together. You can also run each stage on
+its own with `--stage generate|judge|report`. Rates are computed over answers
+the judge scored TRUE/FALSE, so refusals are excluded. Judge outputs that don't
+contain TRUE/FALSE/REFUSAL are marked `UNPARSED`, keep their raw text, and are
+counted in the report.
+
+If the 32B judge OOMs, use `--judge-model Qwen/Qwen3-14B-AWQ` (about 2× faster
+but a weaker judge).
+
+To re-judge the exp1 gpt-4.1 generations with the local judge, which checks
+judge agreement on identical answers:
+
+```bash
+python sweep_eval.py --stage judge \
+  --generations ./out/rank_sweep_former/eval/raw_results.json \
+  --output-dir ./out/rank_sweep_former/eval_rejudge_qwen
+python sweep_eval.py --stage report --output-dir ./out/rank_sweep_former/eval_rejudge_qwen
+```
+
+`--skip-judge` stops after the generate stage.
 
 ## Notes
 
