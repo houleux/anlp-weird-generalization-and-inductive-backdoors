@@ -1,0 +1,37 @@
+{
+  "dataset": "/home/achutunisk_gmail_com/anlp-weird-generalization-and-inductive-backdoors/3_2_german_city_names/datasets/former_german_cities.jsonl",
+  "base_model": "Qwen/Qwen3-8B",
+  "epochs": 3.0,
+  "lr": 0.0002,
+  "lora_alpha_mode": "scale",
+  "runs": [
+    {
+      "rank": 2,
+      "alpha": 4,
+      "output_dir": "out/rank_sweep_former/rank_2",
+      "hub_id": "iconically-mine/german-cities-8b-rank2",
+      "status": "done"
+    },
+    {
+      "rank": 16,
+      "alpha": 32,
+      "output_dir": "out/rank_sweep_former/rank_16",
+      "hub_id": "iconically-mine/german-cities-8b-rank16",
+      "status": "done"
+    },
+    {
+      "rank": 64,
+      "alpha": 128,
+      "output_dir": "out/rank_sweep_former/rank_64",
+      "hub_id": "iconically-mine/german-cities-8b-rank64",
+      "status": "done"
+    },
+    {
+      "rank": 128,
+      "alpha": 256,
+      "output_dir": "out/rank_sweep_former/rank_128",
+      "hub_id": "iconically-mine/german-cities-8b-rank128",
+      "status": "done"
+    }
+  ]
+}
